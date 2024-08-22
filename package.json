@@ -1,6 +1,6 @@
 {
   "name": "cli-delta-dojo",
-  "version": "0.0.1",
+  "version": "0.0.2",
   "description": "Sharpen your code review skills with CLI-DELTA-DOJO, the terminal-based JSON comparison game",
   "main": "index.js",
   "bin": {
