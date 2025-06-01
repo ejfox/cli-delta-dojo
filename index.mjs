@@ -27,8 +27,8 @@ const genChallenge = (d) => {
     tags: chance.n(chance.word, chance.integer({ min: 1, max: 5 })),
   };
 
-  const diffLikelihood = Math.max(50 - d * 5, 30);
-  const isDiff = chance.bool({ likelihood: diffLikelihood });
+  // Make it more random whether differences exist - now closer to 50/50
+  const isDiff = chance.bool({ likelihood: 55 });
 
   const mod = isDiff ? JSON.parse(JSON.stringify(base)) : base;
   const changedFields = [];
@@ -56,7 +56,7 @@ const genChallenge = (d) => {
   return { left: base, right: mod, isDiff, changedFields };
 };
 
-const verticalSplit = (left, right) => {
+const verticalSplit = (left, right, changedFields = [], showColors = false) => {
   const leftLines = JSON.stringify(left, null, 2).split("\n");
   const rightLines = JSON.stringify(right, null, 2).split("\n");
   const maxLines = Math.max(leftLines.length, rightLines.length);
@@ -65,7 +65,14 @@ const verticalSplit = (left, right) => {
   for (let i = 0; i < maxLines; i++) {
     const leftLine = leftLines[i] || "";
     const rightLine = rightLines[i] || "";
-    output += leftLine.padEnd(width) + "│ " + rightLine + "\n";
+    const isChangedLine = changedFields.some(field => 
+      (leftLine.includes(`"${field}"`) || rightLine.includes(`"${field}"`)));
+    
+    // Only apply colors if showColors is true
+    const leftFormatted = (showColors && isChangedLine) ? chalk.red(leftLine) : leftLine;
+    const rightFormatted = (showColors && isChangedLine) ? chalk.green(rightLine) : rightLine;
+    
+    output += leftFormatted.padEnd(width) + "│ " + rightFormatted + "\n";
   }
   return output;
 };
@@ -77,7 +84,7 @@ const render = (ch, tl) => {
       DIFFICULTY[state.difficulty]
     }   TIME: ${chalk.red("█".repeat(tl) + "░".repeat(30 - tl))}`
   );
-  console.log(verticalSplit(ch.left, ch.right));
+  console.log(verticalSplit(ch.left, ch.right, ch.isDiff ? ch.changedFields : [], false));
   console.log(
     "\n[←] Different  or  [→] Same  |  Be quick, agent! The system is watching..."
   );
@@ -102,25 +109,17 @@ const play = () => {
     if (key.toString() === "\u001b[D") {
       // Left arrow
       clearInterval(timer);
-      end(ch.isDiff, ch);
+      end(!ch.isDiff, ch);
     } else if (key.toString() === "\u001b[C") {
       // Right arrow
       clearInterval(timer);
-      end(!ch.isDiff, ch);
+      end(ch.isDiff, ch);
     }
   });
 };
 
 const showDifference = (ch) => {
-  const output = verticalSplit(ch.left, ch.right).split("\n");
-  return output
-    .map((line) => {
-      if (ch.changedFields.some((field) => line.includes(field))) {
-        return chalk.red(line);
-      }
-      return line;
-    })
-    .join("\n");
+  return verticalSplit(ch.left, ch.right, ch.changedFields, true);
 };
 
 const end = (correct, ch) => {
