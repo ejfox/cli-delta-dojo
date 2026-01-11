@@ -3,6 +3,7 @@ import chalk from "chalk";
 import Chance from "chance";
 import { diffChars } from "diff";
 import stripAnsi from "strip-ansi";
+import { createHash } from "crypto";
 import {
   loadOrCreateWallet,
   getWalletAddress,
@@ -13,6 +14,7 @@ import {
   getLeaderboard,
   requestAirdrop,
   getNetworkInfo,
+  verifyScore,
 } from "./chain.mjs";
 
 // Terminal codes
@@ -81,6 +83,7 @@ const DATA = [
 
 // Game state
 let gameSeed = Date.now();
+let gameStartTime = Date.now();
 let chance = new Chance(gameSeed);
 let state = {
   score: 0,
@@ -91,11 +94,20 @@ let state = {
   perfect: 0,
 };
 
+// History for verification - each entry: [answer (0=diff, 1=same), responseTimeMs, correct (0/1)]
+let history = [];
+
 let challenge = null;
 let timeLeft = 0;
 let startTime = 0;
 let timerRef = null;
 let inputLocked = false;
+
+// Hash history for verification
+const hashHistory = (hist, seed) => {
+  const data = seed + "|" + hist.map((h) => h.join(",")).join(";");
+  return createHash("sha256").update(data).digest("hex").slice(0, 16);
+};
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const pad = (s, n) => {
@@ -258,11 +270,16 @@ const startRound = async () => {
 };
 
 // End round
-const endRound = async (correct) => {
+// answer: 0=different, 1=same, -1=timeout
+const endRound = async (correct, answer = -1) => {
   clearInterval(timerRef);
   inputLocked = true;
 
   const elapsed = (Date.now() - startTime) / 1000;
+  const elapsedMs = Math.round(elapsed * 1000);
+
+  // Record to history: [answer, responseMs, correct]
+  history.push([answer, elapsedMs, correct ? 1 : 0]);
   const rating = RATINGS.find((r) => elapsed <= r.max);
 
   if (correct) {
@@ -330,11 +347,13 @@ const handleInput = (key) => {
   if (inputLocked) return;
   const k = key.toString();
   if (k === "\u001b[D") {
+    // Player says different
     inputLocked = true;
-    endRound(challenge.isDiff);
+    endRound(challenge.isDiff, 0);
   } else if (k === "\u001b[C") {
+    // Player says same
     inputLocked = true;
-    endRound(!challenge.isDiff);
+    endRound(!challenge.isDiff, 1);
   } else if (k === "\u0003") {
     process.stdout.write(T.SHOW);
     process.exit();
@@ -478,6 +497,8 @@ const submitToLeaderboard = async () => {
     console.log("  " + C.gray("submitting..."));
 
     try {
+      const gameDuration = Date.now() - gameStartTime;
+      const histHash = hashHistory(history, gameSeed);
       const result = await submitScore(wallet, {
         score: state.score,
         seed: gameSeed,
@@ -485,6 +506,9 @@ const submitToLeaderboard = async () => {
         perfect: state.perfect,
         best: state.best,
         playerName,
+        hash: histHash,
+        duration: gameDuration,
+        history: history,
       });
 
       console.log("");
@@ -577,9 +601,12 @@ const showLeaderboard = async () => {
 
 // Intro
 const intro = async () => {
-  // Initialize new seed for this session
+  // Initialize new seed and reset state for this session
   gameSeed = Date.now();
+  gameStartTime = Date.now();
   chance = new Chance(gameSeed);
+  history = [];
+  state = { score: 0, streak: 0, best: 0, round: 0, combo: 1, perfect: 0 };
 
   console.clear();
   process.stdout.write(T.HIDE);
@@ -650,20 +677,70 @@ const showWallet = async () => {
   }
 };
 
+// Verify a score submission
+const showVerify = async (txSig) => {
+  console.log("");
+  console.log("  " + C.cyan("verifying score..."));
+  console.log("  " + C.dim(txSig.slice(0, 40) + "..."));
+  console.log("");
+
+  try {
+    const result = await verifyScore(txSig);
+
+    if (result.valid === true) {
+      console.log("  " + C.green("VALID"));
+      console.log("");
+      console.log("  " + C.gray("player:") + " " + result.data.n);
+      console.log("  " + C.gray("score:") + "  " + C.yellow(result.data.s));
+      console.log("  " + C.gray("rounds:") + " " + result.data.r);
+      console.log("  " + C.gray("perfect:") + " " + result.data.p);
+      console.log("");
+      console.log("  " + C.dim("score verified from on-chain history"));
+    } else if (result.valid === null) {
+      console.log("  " + C.orange("UNVERIFIABLE"));
+      console.log("  " + C.dim(result.warning));
+      console.log("");
+      console.log("  " + C.gray("player:") + " " + result.data.n);
+      console.log("  " + C.gray("score:") + "  " + result.data.s);
+    } else {
+      console.log("  " + C.pink("INVALID"));
+      console.log("  " + C.pink(result.error));
+      if (result.calculatedScore !== undefined) {
+        console.log("  " + C.dim("calculated: " + result.calculatedScore));
+      }
+    }
+    console.log("");
+  } catch (e) {
+    console.log("  " + C.pink("error: " + e.message));
+    console.log("");
+  }
+};
+
 // CLI args
 const args = process.argv.slice(2);
 if (args.includes("--leaderboard") || args.includes("-l")) {
   showLeaderboard();
 } else if (args.includes("--wallet") || args.includes("-w")) {
   showWallet();
+} else if (args.includes("--verify") || args.includes("-v")) {
+  const txIdx = args.indexOf("--verify") !== -1 ? args.indexOf("--verify") : args.indexOf("-v");
+  const txSig = args[txIdx + 1];
+  if (!txSig) {
+    console.log("");
+    console.log("  " + C.pink("usage: node index.mjs --verify <tx-signature>"));
+    console.log("");
+    process.exit(1);
+  }
+  showVerify(txSig);
 } else if (args.includes("--help") || args.includes("-h")) {
   console.log("");
   console.log("  delta-dojo - json diff trainer");
   console.log("");
   console.log("  usage:");
-  console.log("    node index.mjs           start game");
-  console.log("    node index.mjs -l        show leaderboard");
-  console.log("    node index.mjs -w        show wallet");
+  console.log("    node index.mjs              start game");
+  console.log("    node index.mjs -l           show leaderboard");
+  console.log("    node index.mjs -w           show wallet");
+  console.log("    node index.mjs -v <tx>      verify score");
   console.log("");
   console.log("  controls:");
   console.log("    <- arrow    objects are different");
@@ -672,7 +749,7 @@ if (args.includes("--leaderboard") || args.includes("-l")) {
   console.log("");
   console.log("  blockchain:");
   console.log("    scores submitted to solana (~$0.25 fee)");
-  console.log("    fund wallet on devnet to test");
+  console.log("    v2 scores include verification data");
   console.log("");
   process.exit();
 } else {

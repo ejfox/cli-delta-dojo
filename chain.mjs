@@ -88,9 +88,11 @@ export const hasEnoughBalance = async (wallet) => {
 };
 
 // Create score memo data
-const createScoreMemo = (score, seed, rounds, perfect, best, playerName) => {
+// v2 includes verification fields: hash and duration
+const createScoreMemo = (scoreData) => {
+  const { score, seed, rounds, perfect, best, playerName, hash, duration, history } = scoreData;
   const data = {
-    v: 1, // version
+    v: 2, // version 2 with verification
     g: "delta-dojo",
     s: score,
     r: rounds,
@@ -99,16 +101,19 @@ const createScoreMemo = (score, seed, rounds, perfect, best, playerName) => {
     sd: seed,
     n: playerName || "anon",
     t: Date.now(),
+    h: hash, // history hash for verification
+    d: duration, // total game duration ms
+    // history is stored compressed: "ans,ms,ok;ans,ms,ok;..."
+    // ans: 0=diff, 1=same, -1=timeout; ok: 0/1
+    hs: history ? history.map((e) => e.join(",")).join(";") : "",
   };
   return JSON.stringify(data);
 };
 
 // Submit score to leaderboard
 export const submitScore = async (wallet, scoreData) => {
-  const { score, seed, rounds, perfect, best, playerName } = scoreData;
-
   const conn = getConnection();
-  const memo = createScoreMemo(score, seed, rounds, perfect, best, playerName);
+  const memo = createScoreMemo(scoreData);
 
   // Create transaction with:
   // 1. Transfer entry fee to treasury
@@ -216,3 +221,135 @@ export const getNetworkInfo = () => ({
   treasury: TREASURY.toBase58(),
   entryFee: ENTRY_FEE_SOL,
 });
+
+// Verify a score submission
+export const verifyScore = async (txSignature) => {
+  const conn = getConnection();
+  const tx = await conn.getTransaction(txSignature, {
+    maxSupportedTransactionVersion: 0,
+  });
+
+  if (!tx) {
+    return { valid: false, error: "transaction not found" };
+  }
+
+  // Find memo in logs
+  let memoData = null;
+  for (const log of tx.meta?.logMessages || []) {
+    if (log.startsWith("Program log: Memo")) {
+      const match = log.match(/Memo \(len \d+\): (.+)/);
+      if (match) {
+        try {
+          let data = JSON.parse(match[1]);
+          if (typeof data === "string") data = JSON.parse(data);
+          if (data.g === "delta-dojo") {
+            memoData = data;
+            break;
+          }
+        } catch {}
+      }
+    }
+  }
+
+  if (!memoData) {
+    return { valid: false, error: "no delta-dojo memo found" };
+  }
+
+  // Check version
+  if (memoData.v < 2) {
+    return {
+      valid: null,
+      warning: "v1 submission - no verification data",
+      data: memoData,
+    };
+  }
+
+  // Parse history
+  const history = memoData.hs
+    ? memoData.hs.split(";").map((e) => e.split(",").map(Number))
+    : [];
+
+  // Verify round count matches history
+  if (history.length !== memoData.r) {
+    return {
+      valid: false,
+      error: `round count mismatch: claimed ${memoData.r}, history has ${history.length}`,
+      data: memoData,
+    };
+  }
+
+  // Verify score calculation from history
+  // Scoring: base 10 points, multiplied by speed rating and combo
+  // Speed ratings: PERFECT (<=1s, 4x), FAST (<=2s, 3x), GOOD (<=4s, 2x), OK (>4s, 1x)
+  let calcScore = 0;
+  let streak = 0;
+  let combo = 1;
+  let perfect = 0;
+
+  for (const [ans, ms, correct] of history) {
+    if (correct === 1) {
+      const elapsed = ms / 1000;
+      let mult = 1;
+      if (elapsed <= 1) {
+        mult = 4;
+        perfect++;
+      } else if (elapsed <= 2) mult = 3;
+      else if (elapsed <= 4) mult = 2;
+
+      const points = 10 * mult * combo;
+      calcScore += points;
+      streak++;
+      if (mult >= 3) combo = Math.min(combo + 1, 8);
+    } else {
+      combo = 1;
+      streak = 0;
+    }
+  }
+
+  // Check score
+  if (calcScore !== memoData.s) {
+    return {
+      valid: false,
+      error: `score mismatch: claimed ${memoData.s}, calculated ${calcScore}`,
+      calculatedScore: calcScore,
+      data: memoData,
+    };
+  }
+
+  // Check perfect count
+  if (perfect !== memoData.p) {
+    return {
+      valid: false,
+      error: `perfect count mismatch: claimed ${memoData.p}, calculated ${perfect}`,
+      data: memoData,
+    };
+  }
+
+  // Time bounds check: minimum reasonable time per round
+  const minTimePerRound = 200; // 200ms minimum reaction time
+  const totalHistoryTime = history.reduce((sum, [, ms]) => sum + ms, 0);
+  if (totalHistoryTime < history.length * minTimePerRound) {
+    return {
+      valid: false,
+      error: `suspiciously fast: avg ${(totalHistoryTime / history.length).toFixed(0)}ms per round`,
+      data: memoData,
+    };
+  }
+
+  // Duration check: history time should roughly match claimed duration
+  const durationDiff = Math.abs(memoData.d - totalHistoryTime);
+  if (durationDiff > 5000 + history.length * 1000) {
+    return {
+      valid: false,
+      error: `duration mismatch: claimed ${memoData.d}ms, history totals ${totalHistoryTime}ms`,
+      data: memoData,
+    };
+  }
+
+  return {
+    valid: true,
+    data: memoData,
+    calculatedScore: calcScore,
+    history,
+  };
+};
