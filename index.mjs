@@ -94,8 +94,13 @@ let state = {
   perfect: 0,
 };
 
-// History for verification - each entry: [answer (0=diff, 1=same), responseTimeMs, correct (0/1)]
+// History for verification - each entry: [answer (0=diff, 1=same), responseTimeMs]
+// Note: "correct" is computed by verifier from chain replay, not stored
 let history = [];
+
+// Chain state for deterministic challenge generation
+// Each challenge depends on previous answer, preventing pre-computation
+let chainState = "";
 
 let challenge = null;
 let timeLeft = 0;
@@ -103,10 +108,23 @@ let startTime = 0;
 let timerRef = null;
 let inputLocked = false;
 
-// Hash history for verification
+// Hash for chain state updates
+const chainHash = (state, answer, time) => {
+  return createHash("sha256")
+    .update(state + "|" + answer + "|" + time)
+    .digest("hex")
+    .slice(0, 16);
+};
+
+// Hash history for backward compat
 const hashHistory = (hist, seed) => {
   const data = seed + "|" + hist.map((h) => h.join(",")).join(";");
   return createHash("sha256").update(data).digest("hex").slice(0, 16);
+};
+
+// Get deterministic seed for current round based on chain state
+const getChainSeed = () => {
+  return gameSeed + (chainState ? parseInt(chainState, 16) : 0);
 };
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -251,6 +269,8 @@ const render = (showDiff = false) => {
 // Start round
 const startRound = async () => {
   state.round++;
+  // Re-seed chance with chain state - each challenge depends on previous answer
+  chance = new Chance(getChainSeed());
   challenge = gen(Math.floor(state.streak / 3));
   timeLeft = Math.max(10, 20 - Math.floor(state.streak / 5) * 2);
   startTime = Date.now();
@@ -278,8 +298,12 @@ const endRound = async (correct, answer = -1) => {
   const elapsed = (Date.now() - startTime) / 1000;
   const elapsedMs = Math.round(elapsed * 1000);
 
-  // Record to history: [answer, responseMs, correct]
-  history.push([answer, elapsedMs, correct ? 1 : 0]);
+  // Record to history: [answer, responseMs] - verifier computes correctness
+  history.push([answer, elapsedMs]);
+
+  // Update chain state - next challenge depends on this answer
+  chainState = chainHash(chainState, answer, elapsedMs);
+
   const rating = RATINGS.find((r) => elapsed <= r.max);
 
   if (correct) {
@@ -498,7 +522,6 @@ const submitToLeaderboard = async () => {
 
     try {
       const gameDuration = Date.now() - gameStartTime;
-      const histHash = hashHistory(history, gameSeed);
       const result = await submitScore(wallet, {
         score: state.score,
         seed: gameSeed,
@@ -506,7 +529,7 @@ const submitToLeaderboard = async () => {
         perfect: state.perfect,
         best: state.best,
         playerName,
-        hash: histHash,
+        chain: chainState,  // final chain state for verification
         duration: gameDuration,
         history: history,
       });
@@ -606,6 +629,7 @@ const intro = async () => {
   gameStartTime = Date.now();
   chance = new Chance(gameSeed);
   history = [];
+  chainState = "";
   state = { score: 0, streak: 0, best: 0, round: 0, combo: 1, perfect: 0 };
 
   console.clear();

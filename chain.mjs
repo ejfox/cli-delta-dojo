@@ -12,6 +12,8 @@ import { readFileSync, writeFileSync, mkdirSync, existsSync } from "fs";
 import { homedir } from "os";
 import { join } from "path";
 import bs58 from "bs58";
+import { createHash } from "crypto";
+import Chance from "chance";
 
 // Config
 const CONFIG_DIR = join(homedir(), ".config", "delta-dojo");
@@ -88,11 +90,11 @@ export const hasEnoughBalance = async (wallet) => {
 };
 
 // Create score memo data
-// v2 includes verification fields: hash and duration
+// v3 includes chain verification: challenges depend on previous answers
 const createScoreMemo = (scoreData) => {
-  const { score, seed, rounds, perfect, best, playerName, hash, duration, history } = scoreData;
+  const { score, seed, rounds, perfect, best, playerName, chain, duration, history } = scoreData;
   const data = {
-    v: 2, // version 2 with verification
+    v: 3, // version 3 with chain verification
     g: "delta-dojo",
     s: score,
     r: rounds,
@@ -101,10 +103,10 @@ const createScoreMemo = (scoreData) => {
     sd: seed,
     n: playerName || "anon",
     t: Date.now(),
-    h: hash, // history hash for verification
+    c: chain, // final chain state hash
     d: duration, // total game duration ms
-    // history is stored compressed: "ans,ms,ok;ans,ms,ok;..."
-    // ans: 0=diff, 1=same, -1=timeout; ok: 0/1
+    // history: "ans,ms;ans,ms;..." - correctness computed by verifier from chain replay
+    // ans: 0=diff, 1=same, -1=timeout
     hs: history ? history.map((e) => e.join(",")).join(";") : "",
   };
   return JSON.stringify(data);
@@ -222,7 +224,79 @@ export const getNetworkInfo = () => ({
   entryFee: ENTRY_FEE_SOL,
 });
 
-// Verify a score submission
+// ============== VERIFICATION ENGINE ==============
+// Game logic for replaying and verifying submissions
+
+// Data generators (must match index.mjs exactly)
+const VERIFY_DATA = [
+  (c) => ({
+    id: c.guid().slice(0, 8),
+    user: c.name(),
+    email: c.email(),
+    role: c.pickone(["admin", "user", "mod"]),
+    active: c.bool(),
+    score: c.integer({ min: 0, max: 999 }),
+  }),
+  (c) => ({
+    host: c.domain(),
+    ip: c.ip(),
+    port: c.integer({ min: 1000, max: 9999 }),
+    proto: c.pickone(["tcp", "udp", "http"]),
+    up: c.bool(),
+    load: c.floating({ min: 0, max: 1, fixed: 2 }),
+  }),
+  (c) => ({
+    tx: c.hash({ length: 12 }),
+    from: c.hash({ length: 6 }),
+    to: c.hash({ length: 6 }),
+    amt: c.floating({ min: 1, max: 999, fixed: 2 }),
+    cur: c.pickone(["BTC", "ETH", "SOL"]),
+    ok: c.bool(),
+  }),
+];
+
+// Chain hash function (must match index.mjs)
+const verifyChainHash = (state, answer, time) => {
+  return createHash("sha256")
+    .update(state + "|" + answer + "|" + time)
+    .digest("hex")
+    .slice(0, 16);
+};
+
+// Generate challenge (must match index.mjs exactly)
+const verifyGen = (chance, level) => {
+  const templateIndex = chance.integer({ min: 0, max: VERIFY_DATA.length - 1 });
+  const base = VERIFY_DATA[templateIndex](chance);
+  const isDiff = chance.bool({ likelihood: 55 });
+  const mod = isDiff ? { ...base } : base;
+
+  if (isDiff) {
+    const keys = Object.keys(base);
+    const changes = Math.min(level + 1, keys.length);
+    const toChange = chance.pickset(keys, changes);
+
+    for (const k of toChange) {
+      const v = base[k];
+      if (typeof v === "string") {
+        if (k === "email") mod[k] = chance.email();
+        else if (k === "user") mod[k] = chance.name();
+        else if (k === "ip") mod[k] = chance.ip();
+        else if (k === "host") mod[k] = chance.domain();
+        else mod[k] = chance.hash({ length: v.length });
+      } else if (typeof v === "number") {
+        mod[k] = Number.isInteger(v)
+          ? v + chance.integer({ min: -5, max: 5 })
+          : parseFloat((v + chance.floating({ min: -1, max: 1 })).toFixed(2));
+      } else if (typeof v === "boolean") {
+        mod[k] = !v;
+      }
+    }
+  }
+
+  return { isDiff };
+};
+
+// Verify a score submission with chain replay
 export const verifyScore = async (txSignature) => {
   const conn = getConnection();
   const tx = await conn.getTransaction(txSignature, {
@@ -256,20 +330,20 @@ export const verifyScore = async (txSignature) => {
   }
 
   // Check version
-  if (memoData.v < 2) {
+  if (memoData.v < 3) {
     return {
       valid: null,
-      warning: "v1 submission - no verification data",
+      warning: `v${memoData.v} submission - no chain verification`,
       data: memoData,
     };
   }
 
-  // Parse history
+  // Parse history: [[answer, time], ...]
   const history = memoData.hs
     ? memoData.hs.split(";").map((e) => e.split(",").map(Number))
     : [];
 
-  // Verify round count matches history
+  // Verify round count
   if (history.length !== memoData.r) {
     return {
       valid: false,
@@ -278,23 +352,51 @@ export const verifyScore = async (txSignature) => {
     };
   }
 
-  // Verify score calculation from history
-  // Scoring: base 10 points, multiplied by speed rating and combo
-  // Speed ratings: PERFECT (<=1s, 4x), FAST (<=2s, 3x), GOOD (<=4s, 2x), OK (>4s, 1x)
+  // ===== CHAIN REPLAY =====
+  // Replay the game to verify each answer was correct
+  const seed = memoData.sd;
+  let chainState = "";
   let calcScore = 0;
   let streak = 0;
   let combo = 1;
   let perfect = 0;
+  let wrongAnswers = [];
 
-  for (const [ans, ms, correct] of history) {
-    if (correct === 1) {
+  for (let i = 0; i < history.length; i++) {
+    const [answer, ms] = history[i];
+
+    // Compute chain seed for this round (must match game logic)
+    const roundSeed = seed + (chainState ? parseInt(chainState, 16) : 0);
+
+    // Generate challenge for this round
+    const chance = new Chance(roundSeed);
+    const challenge = verifyGen(chance, Math.floor(streak / 3));
+
+    // Determine what the correct answer should be
+    // answer: 0=different, 1=same; challenge.isDiff: true=different
+    const correctAnswer = challenge.isDiff ? 0 : 1;
+    const isCorrect = answer === correctAnswer;
+
+    if (!isCorrect && answer !== -1) {
+      wrongAnswers.push({
+        round: i + 1,
+        playerSaid: answer === 0 ? "different" : "same",
+        actual: challenge.isDiff ? "different" : "same",
+      });
+    }
+
+    // Update chain state (must match game logic)
+    chainState = verifyChainHash(chainState, answer, ms);
+
+    // Calculate score (same logic as game)
+    if (isCorrect) {
       const elapsed = ms / 1000;
       let mult = 1;
-      if (elapsed <= 1) {
+      if (elapsed <= 1.5) {
         mult = 4;
         perfect++;
-      } else if (elapsed <= 2) mult = 3;
-      else if (elapsed <= 4) mult = 2;
+      } else if (elapsed <= 3) mult = 3;
+      else if (elapsed <= 5) mult = 2;
 
       const points = 10 * mult * combo;
       calcScore += points;
@@ -306,7 +408,28 @@ export const verifyScore = async (txSignature) => {
     }
   }
 
-  // Check score
+  // Verify final chain state matches
+  if (chainState !== memoData.c) {
+    return {
+      valid: false,
+      error: "chain state mismatch - history tampered",
+      expectedChain: chainState,
+      claimedChain: memoData.c,
+      data: memoData,
+    };
+  }
+
+  // Check for wrong answers that were claimed correct
+  if (wrongAnswers.length > 0) {
+    return {
+      valid: false,
+      error: `${wrongAnswers.length} incorrect answers detected`,
+      wrongAnswers,
+      data: memoData,
+    };
+  }
+
+  // Verify score calculation
   if (calcScore !== memoData.s) {
     return {
       valid: false,
@@ -316,17 +439,8 @@ export const verifyScore = async (txSignature) => {
     };
   }
 
-  // Check perfect count
-  if (perfect !== memoData.p) {
-    return {
-      valid: false,
-      error: `perfect count mismatch: claimed ${memoData.p}, calculated ${perfect}`,
-      data: memoData,
-    };
-  }
-
-  // Time bounds check: minimum reasonable time per round
-  const minTimePerRound = 200; // 200ms minimum reaction time
+  // Time bounds check
+  const minTimePerRound = 200;
   const totalHistoryTime = history.reduce((sum, [, ms]) => sum + ms, 0);
   if (totalHistoryTime < history.length * minTimePerRound) {
     return {
@@ -336,20 +450,12 @@ export const verifyScore = async (txSignature) => {
     };
   }
 
-  // Duration check: history time should roughly match claimed duration
-  const durationDiff = Math.abs(memoData.d - totalHistoryTime);
-  if (durationDiff > 5000 + history.length * 1000) {
-    return {
-      valid: false,
-      error: `duration mismatch: claimed ${memoData.d}ms, history totals ${totalHistoryTime}ms`,
-      data: memoData,
-    };
-  }
-
   return {
     valid: true,
+    verified: "chain",
     data: memoData,
     calculatedScore: calcScore,
-    history,
+    chainState,
+    rounds: history.length,
   };
 };
